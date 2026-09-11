@@ -1,4 +1,4 @@
-# 💻 Systems Coding & Automation: Exhaustive Interview Question Bank (Top 30 Questions)
+# 💻 Systems Coding & Automation: Exhaustive Interview Question Bank (Top 40 Questions)
 
 > **Target Level**: Senior / Staff SRE & Platform Engineer (6.5+ YoE)  
 > **Evaluation Focus**: Go concurrency primitives (Goroutines, Channels, Select, Mutexes, Context), Python memory optimization, thread-safe data structures, and SRE algorithm design.
@@ -536,3 +536,334 @@
 > }
 > ```
 > - Prevents socket exhaustion, connection leaks, and thread starvation under high traffic.
+
+---
+
+### Q31: How does the Go runtime scheduler (G-M-P Model) implement work-stealing and cooperative vs non-cooperative preemption?
+> **Deep Answer**:
+> - **The G-M-P Architecture**:
+>   - **G (Goroutine)**: Lightweight user-space thread (starts at 2KB stack). Contains PC, SP, and stack pointers.
+>   - **M (Machine / OS Thread)**: Created by OS kernel (`pthread`).
+>   - **P (Processor / Logical Context)**: Represents resource required to execute Go code. Count fixed to `GOMAXPROCS` (number of CPU cores).
+> - **Work-Stealing Algorithm**:
+>   - Each P has a local 256-element run queue (`runq`).
+>   - When a thread M runs out of work in its local P:
+>     1. Checks the Global Run Queue.
+>     2. Checks Network Poller (`netpoll` via epoll/kqueue).
+>     3. **Steals Work**: Randomly selects another P and steals **half of its local runnable goroutines**.
+> - **Preemption (Go 1.14+ Async Preemption)**:
+>   - Older Go relied on function prologues (`morestack()`). A tight CPU loop `for {}` without function calls could freeze a thread forever.
+>   - Modern Go uses OS signals (`SIGURG` on Unix): A background monitor (`sysmon`) sends `SIGURG` to thread M, which intercepts the signal, saves registers, and deschedules long-running goroutines (>10ms).
+
+---
+
+### Q32: Implement an $O(1)$ Least Recently Used (LRU) Cache in Python using a doubly linked list and hash map.
+> **Deep Answer**:
+> ```python
+> class Node:
+>     def __init__(self, key=0, val=0):
+>         self.key = key
+>         self.val = val
+>         self.prev = None
+>         self.next = None
+>
+> class LRUCache:
+>     def __init__(self, capacity: int):
+>         self.cap = capacity
+>         self.cache = {} # key -> Node
+>         self.head = Node() # Dummy head
+>         self.tail = Node() # Dummy tail
+>         self.head.next = self.tail
+>         self.tail.prev = self.head
+>
+>     def _remove(self, node: Node):
+>         node.prev.next = node.next
+>         node.next.prev = node.prev
+>
+>     def _add(self, node: Node):
+>         # Add node right after dummy head
+>         node.next = self.head.next
+>         node.prev = self.head
+>         self.head.next.prev = node
+>         self.head.next = node
+>
+>     def get(self, key: int) -> int:
+>         if key in self.cache:
+>             node = self.cache[key]
+>             self._remove(node)
+>             self._add(node)
+>             return node.val
+>         return -1
+>
+>     def put(self, key: int, value: int) -> None:
+>         if key in self.cache:
+>             self._remove(self.cache[key])
+>         node = Node(key, value)
+>         self._add(node)
+>         self.cache[key] = node
+>         if len(self.cache) > self.cap:
+>             # Evict least recently used node (before dummy tail)
+>             lru = self.tail.prev
+>             self._remove(lru)
+>             del self.cache[lru.key]
+> ```
+
+---
+
+### Q33: How do you use Python `asyncio.TaskGroup` (Python 3.11+) with structured concurrency and exception handling?
+> **Deep Answer**:
+> - **The Problem with `asyncio.gather()`**: If one task crashes with an unhandled exception, other child tasks continue running in the background as orphaned tasks ("Fire-and-forget leaks").
+> - **Structured Concurrency with `TaskGroup`**:
+>   ```python
+>   import asyncio
+>   from typing import List
+>
+>   async def fetch_metrics(node_id: str) -> dict:
+>       await asyncio.sleep(0.5)
+>       if node_id == "node-3":
+>           raise ConnectionResetError("Node 3 connection dropped")
+>       return {"node": node_id, "status": "healthy"}
+>
+>   async def query_cluster(nodes: List[str]):
+>       results = []
+>       try:
+>           async with asyncio.TaskGroup() as tg:
+>               tasks = [tg.create_task(fetch_metrics(n)) for n in nodes]
+>           results = [t.result() for t in tasks]
+>       except* ConnectionResetError as eg: # Python 3.11 ExceptionGroup syntax
+>           print(f"Handled network errors: {eg.exceptions}")
+>       return results
+>   ```
+> - **Guarantee**: If any task fails, `TaskGroup` immediately cancels all other active tasks within the context block before raising an `ExceptionGroup`.
+
+---
+
+### Q34: Implement an atomic Compare-And-Swap (CAS) Spinlock in Go using `sync/atomic`.
+> **Deep Answer**:
+> ```go
+> package spinlock
+>
+> import (
+>     "runtime"
+>     "sync/atomic"
+> )
+>
+> type SpinLock struct {
+>     state uint32 // 0: unlocked, 1: locked
+> }
+>
+> func (sl *SpinLock) Lock() {
+>     for !atomic.CompareAndSwapUint32(&sl.state, 0, 1) {
+>         // Spin wait: Pause CPU instruction pipeline to reduce bus contention
+>         runtime.Gosched()
+>     }
+> }
+>
+> func (sl *SpinLock) Unlock() {
+>     atomic.StoreUint32(&sl.state, 0)
+> }
+> ```
+> - **Tradeoff**: Spinlocks avoid OS context-switch overhead for ultra-short critical sections ($< 50\text{ns}$), but burn 100% CPU if held across blocking I/O calls.
+
+---
+
+### Q35: How do you parse multi-gigabyte JSONL log files in Python with $O(1)$ memory consumption using generators?
+> **Deep Answer**:
+> ```python
+> import json
+> from typing import Iterator, Dict, Any
+>
+> def stream_large_log(file_path: str) -> Iterator[Dict[str, Any]]:
+>     """Streams JSONL logs line-by-line with O(1) RAM."""
+>     with open(file_path, "r", encoding="utf-8") as f:
+>         for line_num, line in enumerate(f, 1):
+>             line = line.strip()
+>             if not line:
+>                 continue
+>             try:
+>                 yield json.loads(line)
+>             except json.JSONDecodeError as e:
+>                 # Log error without halting stream
+>                 continue
+>
+> # Filter pipeline:
+> def filter_5xx_errors(records: Iterator[Dict[str, Any]]) -> Iterator[Dict[str, Any]]:
+>     for record in records:
+>         if record.get("status_code", 0) >= 500:
+>             yield record
+>
+> # Usage: Processes 50GB file using < 20MB RAM:
+> for error_event in filter_5xx_errors(stream_large_log("/var/log/app.jsonl")):
+>     process_alert(error_event)
+> ```
+
+---
+
+### Q36: Implement a Sliding Window Counter Rate Limiter in Go with mutex synchronization.
+> **Deep Answer**:
+> ```go
+> type SlidingWindowLimiter struct {
+>     sync.Mutex
+>     limit        int
+>     window       time.Duration
+>     prevCount    int
+>     currentCount int
+>     currentSlot  time.Time
+> }
+>
+> func NewSlidingWindowLimiter(limit int, window time.Duration) *SlidingWindowLimiter {
+>     return &SlidingWindowLimiter{
+>         limit:       limit,
+>         window:      window,
+>         currentSlot: time.Now().Truncate(window),
+>     }
+> }
+>
+> func (s *SlidingWindowLimiter) Allow() bool {
+>     s.Lock()
+>     defer s.Unlock()
+>
+>     now := time.Now()
+>     slot := now.Truncate(s.window)
+>
+>     // Advance sliding window if time moved to new bucket
+>     if slot.After(s.currentSlot) {
+>         if slot.Sub(s.currentSlot) == s.window {
+>             s.prevCount = s.currentCount
+>         } else {
+>             s.prevCount = 0
+>         }
+>         s.currentCount = 0
+>         s.currentSlot = slot
+>     }
+>
+>     // Weight calculation based on time elapsed into current window:
+>     elapsedWeight := float64(now.Sub(s.currentSlot)) / float64(s.window)
+>     estimatedRequests := float64(s.prevCount)*(1.0-elapsedWeight) + float64(s.currentCount)
+>
+>     if estimatedRequests < float64(s.limit) {
+>         s.currentCount++
+>         return true
+>     }
+>     return false
+> }
+> ```
+
+---
+
+### Q37: How do you detect and fix memory leaks in Go using `pprof` heap profiles and inuse vs alloc objects analysis?
+> **Deep Answer**:
+> 1. **Capture Heap Profile**:
+>    ```bash
+>    curl -s http://localhost:6060/debug/pprof/heap > heap.pprof
+>    go tool pprof -http=:8080 heap.pprof
+>    ```
+> 2. **Analyze `inuse_space` vs `alloc_space`**:
+>    - `inuse_space`: Shows memory retained in heap that was not garbage collected.
+>    - `alloc_space`: Shows cumulative total memory allocated since process start.
+> 3. **Identify Leaking Patterns**:
+>    - **Unbounded Goroutines**: Goroutines blocked forever on unbuffered channel sends (`ch <- msg` with no receiver).
+>    - **Slice Sub-slicing Memory Retention**: Sub-slicing a tiny 10-byte slice from a 10MB byte array (`sub := hugeArray[:10]`) retains the entire 10MB backing array in RAM.
+>    - **Fix**: Allocate a fresh slice and copy: `sub := make([]byte, 10); copy(sub, hugeArray[:10])`.
+
+---
+
+### Q38: How do you write an asynchronous streaming S3 uploader in Go using `io.Pipe` without buffering data to disk?
+> **Deep Answer**:
+> ```go
+> func StreamToS3(ctx context.Context, s3Client *s3.Client, bucket, key string, dataProducer func(w io.Writer) error) error {
+>     pr, pw := io.Pipe()
+>     errChan := make(chan error, 1)
+>
+>     // Producer goroutine writes data to pipe writer
+>     go func() {
+>         defer pw.Close()
+>         if err := dataProducer(pw); err != nil {
+>             pw.CloseWithError(err)
+>             errChan <- err
+>             return
+>         }
+>         errChan <- nil
+>     }()
+>
+>     // S3 uploader consumes directly from pipe reader in streaming chunks
+>     uploader := manager.NewUploader(s3Client, func(u *manager.Uploader) {
+>         u.PartSize = 10 * 1024 * 1024 // 10MB Multi-part upload chunk
+>     })
+>
+>     _, err := uploader.Upload(ctx, &s3.PutObjectInput{
+>         Bucket: aws.String(bucket),
+>         Key:    aws.String(key),
+>         Body:   pr,
+>     })
+>     if err != nil { return err }
+>     return <-errChan
+> }
+> ```
+
+---
+
+### Q39: How does Go `sync.Pool` work internally (local pools, private vs shared, GC scavenging), and why shouldn't large dynamic byte slices be stored in it?
+> **Deep Answer**:
+> - **Internal Mechanics**:
+>   - `sync.Pool` maintains per-P `poolLocal` structs:
+>     1. **`private`**: A single item accessible exclusively by the local P with zero locks.
+>     2. **`shared`**: A lock-free deque (`poolChain`) where other Ps can steal objects when their local pool is empty.
+> - **Garbage Collection Scavenging**:
+>   - At every GC cycle, the runtime moves `local` pool items to `victim` cache. On the second GC cycle, unreferenced items in `victim` are freed.
+> - **The Dynamic Slice Pitfall**:
+>   - If an application occasionally puts a 100MB byte slice into `sync.Pool`, that giant slice remains pinned in heap memory, preventing memory reclamation.
+>   - **Best Practice**: Only store objects with fixed, predictable buffer sizes (e.g. 4KB or 64KB buffers) in `sync.Pool`.
+
+---
+
+### Q40: Implement a Distributed Token Bucket algorithm in Python with Redis and Lua scripts for atomic state refresh.
+> **Deep Answer**:
+> ```python
+> import redis
+> import time
+>
+> LUA_TOKEN_BUCKET = """
+> local key = KEYS[1]
+> local max_capacity = tonumber(ARGV[1])
+> local refill_rate = tonumber(ARGV[2]) -- tokens per second
+> local requested = tonumber(ARGV[3])
+> local now = tonumber(ARGV[4])
+>
+> local data = redis.call("HMGET", key, "tokens", "last_updated")
+> local tokens = tonumber(data[1])
+> local last_updated = tonumber(data[2])
+>
+> if not tokens then
+>     tokens = max_capacity
+>     last_updated = now
+> else
+>     local elapsed = math.max(0, now - last_updated)
+>     tokens = math.min(max_capacity, tokens + elapsed * refill_rate)
+>     last_updated = now
+> end
+>
+> if tokens >= requested then
+>     tokens = tokens - requested
+>     redis.call("HMSET", key, "tokens", tokens, "last_updated", last_updated)
+>     redis.call("EXPIRE", key, math.ceil(max_capacity / refill_rate) * 2)
+>     return 1 -- ALLOWED
+> else
+>     redis.call("HMSET", key, "tokens", tokens, "last_updated", last_updated)
+>     return 0 -- REJECTED
+> end
+> """
+>
+> class DistributedTokenBucket:
+>     def __init__(self, r: redis.Redis, bucket_key: str, capacity: int, refill_per_sec: float):
+>         self.r = r
+>         self.key = bucket_key
+>         self.capacity = capacity
+>         self.refill_per_sec = refill_per_sec
+>         self._script = self.r.register_script(LUA_TOKEN_BUCKET)
+>
+>     def acquire(self, tokens: int = 1) -> bool:
+>         now = time.time()
+>         result = self._script(keys=[self.key], args=[self.capacity, self.refill_per_sec, tokens, now])
+>         return result == 1
+> ```

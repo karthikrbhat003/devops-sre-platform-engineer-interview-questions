@@ -1,4 +1,4 @@
-# 🤖 AI for SRE & AI Platform Engineering: Exhaustive Interview Question Bank (Top 30 Questions)
+# 🤖 AI for SRE & AI Platform Engineering: Exhaustive Interview Question Bank (Top 40 Questions)
 
 > **Target Level**: Senior / Staff SRE & Platform Engineer (6.5+ YoE)  
 > **Evaluation Focus**: LLMOps infrastructure, GPU orchestration on Kubernetes, vLLM/Triton serving architectures, Spot GPU cost optimization, and AIOps automated incident triage.
@@ -360,3 +360,175 @@
 >      - **Hallucination Rate**: Did the agent generate non-existent metrics, invalid PromQL syntax, or fictional runbook URLs?
 >      - **Tool Selection Accuracy**: Did the agent call the minimal necessary diagnostic APIs in optimal order?
 >   3. **Continuous Regression Testing**: Run evaluation suite in CI before deploying any prompt updates, model fine-tunes, or RAG retriever modifications.
+
+---
+
+### Q31: How does FlashAttention (v2/v3) achieve massive speedups by restructuring GPU SRAM vs HBM memory I/O access patterns?
+> **Deep Answer**:
+> - **The Standard Attention Memory Bottleneck**:
+>   - Standard Self-Attention computes $S = Q K^T$, $P = \text{softmax}(S)$, and $O = P V$.
+>   - For a sequence length $N$, the intermediate matrices $S$ and $P$ have size $O(N^2)$.
+>   - Storing and reading these $N^2$ matrices between **GPU High Bandwidth Memory (HBM)** and **On-Chip SRAM** creates a massive memory bandwidth bottleneck (Memory-Bound rather than Compute-Bound).
+> - **FlashAttention IO-Aware Mechanics**:
+>   1. **Tiling (Block Computation)**: Splits Query, Key, and Value matrices into small blocks that fit entirely inside high-speed GPU on-chip SRAM (e.g. 192KB per Streaming Multiprocessor).
+>   2. **Online Softmax**: Computes softmax incrementally across blocks without materializing the full $N \times N$ attention matrix in slow HBM.
+>   3. **Kernel Fusion**: Performs the entire attention calculation in a single fused CUDA kernel, avoiding intermediate memory read/write roundtrips.
+> - **Operational SRE Benefit**: Slashes attention compute latency by $2\times$ to $4\times$, reduces VRAM memory consumption from $O(N^2)$ to $O(N)$, and makes 32k–128k context windows feasible in production.
+
+---
+
+### Q32: How does TensorRT-LLM and vLLM In-Flight (Continuous) Batching eliminate iteration-level bubbles compared to static request batching?
+> **Deep Answer**:
+> - **The Static Batching Flaw**:
+>   - If 4 requests with generated lengths (10, 50, 200, 1000 tokens) are batched together, the GPU must run 1,000 iterations for the batch.
+>   - Request 1 finishes in 10 iterations, but its GPU compute and VRAM slots remain locked and idle (wasted bubbles) for 990 iterations until the longest request completes.
+> - **In-Flight / Continuous Batching Mechanics**:
+>   - Operates at the **iteration (token) level** rather than the request level.
+>   - At every forward pass step:
+>     - Any request that emits an `[EOS]` (End-of-Sequence) token is immediately evicted from the batch and its VRAM KV-cache pages are returned to the pool.
+>     - New incoming requests from the pending queue are injected into the vacant batch slots on the very next iteration.
+> - **SRE Metric Impact**: Increases GPU utilization from $\sim 25\%$ to $> 85\%$ and boosts overall inference cluster throughput (Tokens/sec) by **$3\times$ to $5\times$**.
+
+---
+
+### Q33: How does GPUDirect Storage (GDS) with NVMe over Fabrics (NVMe-oF) bypass host CPU and system RAM to stream model weights to VRAM?
+> **Deep Answer**:
+> - **Traditional Model Loading Bottleneck**:
+>   - Model weights (e.g. 140GB for Llama-3-70B) are read from NVMe disk $\rightarrow$ copied to Kernel Page Cache $\rightarrow$ copied to User-Space Host RAM $\rightarrow$ transferred via PCIe DMA to GPU VRAM.
+>   - Creates heavy CPU context switching, saturates system memory buses, and takes 3–5 minutes to load weights during pod restarts.
+> - **GPUDirect Storage (GDS) Architecture (NVIDIA cuFile)**:
+>   - Establishes a direct, hardware DMA path between the NVMe storage controller (or NVMe-oF RDMA NIC) and **GPU High-Bandwidth Memory (HBM)**.
+>   - Completely bypasses host CPU and host system RAM bounce buffers.
+> - **Production SRE Impact**:
+>   - Reduces model weight loading time from 180 seconds to **under 12 seconds**.
+>   - Slashes node autoscaling recovery time and enables fast cold-start scaling on Kubernetes.
+
+---
+
+### Q34: How do you configure KEDA Prometheus Scaler to autoscale vLLM inference replicas based on Queue Depth (`num_requests_waiting`) and TTFT SLOs?
+> **Deep Answer**:
+> - **Why Native CPU/Memory HPA Fails**: An LLM inference pod running at 99% GPU VRAM is completely normal (due to pre-allocated KV-cache). CPU utilization remains low. Traditional HPA cannot detect if 100 user requests are queued waiting for inference slots.
+> - **KEDA ScaledObject Specification**:
+>   ```yaml
+>   apiVersion: keda.sh/v1alpha1
+>   kind: ScaledObject
+>   metadata:
+>     name: vllm-autoscaler
+>   spec:
+>     scaleTargetRef:
+>       apiVersion: apps/v1
+>       kind: Deployment
+>       name: vllm-llama3-70b
+>     minReplicaCount: 2
+>     maxReplicaCount: 16
+>     cooldownPeriod: 300
+>     triggers:
+>       - type: prometheus
+>         metadata:
+>           serverAddress: http://thanos-querier.monitoring:9090
+>           metricName: vllm_num_requests_waiting
+>           # Scale out when average waiting requests per pod exceeds 5:
+>           query: sum(vllm:num_requests_waiting{model="llama3-70b"}) / count(vllm:num_requests_waiting{model="llama3-70b"})
+>           threshold: '5'
+>   ```
+> - **Scaling Behavior**: When queue depth increases, KEDA triggers Karpenter to provision new GPU nodes immediately, keeping Time-To-First-Token (TTFT) within the $< 250\text{ms}$ SLO.
+
+---
+
+### Q35: How do you detect and optimize multi-GPU NVLink vs PCIe bus topology bottlenecks using `nvidia-smi topo -m` and NCCL?
+> **Deep Answer**:
+> - **Diagnosing Bus Interconnects**:
+>   ```bash
+>   nvidia-smi topo -m
+>   ```
+>   - **`NV#` (NVLink)**: Full multi-hundred GB/s bi-directional crossbar bandwidth between GPUs (Optimal for Tensor Parallelism `TP=8`).
+>   - **`PIX` / `PXB` (PCIe Bridge)**: Crosses host PCIe switches ($32–64\text{ GB/s}$), adding latency.
+>   - **`SYS` (System Interconnect / QPI / UPI)**: Traverses CPU sockets across NUMA nodes ($10–20\text{ GB/s}$), creating catastrophic all-reduce communication bottlenecks.
+> - **NCCL Optimization for Distributed Inference**:
+>   - Set NCCL environment variables in pod manifests:
+>     ```yaml
+>     env:
+>       - name: NCCL_DEBUG
+>         value: "INFO"
+>       - name: NCCL_IB_DISABLE
+>         value: "0" # Enable InfiniBand/RoCE
+>       - name: NCCL_TOPO_DUMP_FILE
+>         value: "/tmp/nccl_topo.xml"
+>     ```
+>   - Ensure Tensor Parallelism groups are pinned strictly to GPUs with direct NVLink meshes (`TP <= 8` on an HGX H100 node).
+
+---
+
+### Q36: Compare Weight Quantization Schemes: AWQ vs GPTQ vs FP8 / INT4 for LLM serving throughput and accuracy.
+> **Deep Answer**:
+> - **GPTQ (Accurate Post-Training Quantization)**:
+>   - Second-order error compensation based on approximate Hessian matrix inversions.
+>   - Quantizes all weights uniformly to INT4.
+>   - **Tradeoff**: Good compression, but dequantizing weights during activation forward passes on GPUs can create arithmetic overhead on compute-bound batches.
+> - **AWQ (Activation-aware Weight Quantization)**:
+>   - Recognizes that not all weights are equally important: protects the top **$1\%$ salient weight channels** that correspond to large activation magnitudes in FP16, and quantizes the remaining 99% to INT4.
+>   - **Advantage**: Superior perplexity retention and faster token generation than GPTQ on vLLM.
+> - **FP8 (Native Hardware Float8 - Hopper H100 / Ada Lovelace)**:
+>   - Uses native E4M3 / E5M2 8-bit floating-point tensor cores directly in hardware.
+>   - **Advantage**: Requires zero runtime dequantization overhead. Doubles matrix multiplication throughput (TFLOPS) while cutting VRAM footprint in half with $< 0.5\%$ accuracy loss.
+
+---
+
+### Q37: How do you engineer an AI FinOps Spot GPU training pipeline using Karpenter, S3 Checkpoint streaming, and PyTorch TorchElastic?
+> **Deep Answer**:
+> - **The Problem**: GPU on-demand instances (e.g. AWS `p4de.24xlarge` or GCP `a2-highgpu-8g`) are prohibitively expensive ($30+/hr), but Spot instances can be reclaimed by cloud providers with only a 2-minute termination notice.
+> - **Fault-Tolerant Spot Architecture**:
+>   1. **Karpenter NodePool**: Configured with `capacity-type: ["spot"]` across multiple instance families (`p4d.24xlarge`, `p5.48xlarge`, `g5.48xlarge`) in multiple AZs.
+>   2. **AWS Node Termination Handler / Karpenter Interruption Queue**:
+>      - Catches the 2-minute CloudWatch Spot Interruption Event.
+>      - Sends `SIGTERM` to the master training pod.
+>   3. **PyTorch TorchElastic (`torchrun`) & Async Checkpoint Streaming**:
+>      - Training script catches `SIGTERM`, flushes current optimizer states to local NVMe, and initiates asynchronous multi-part upload to S3/GCS using JuiceFS or AWS S3 Mountpoint.
+>   4. **Elastic Resumption**: When Karpenter provisions a replacement Spot node, TorchElastic automatically discovers existing nodes, pulls the latest S3 checkpoint, and resumes training within 90 seconds without losing epoch progress.
+
+---
+
+### Q38: How do Ray Core Actor scheduling, object store spilling, and Ray Serve handle distributed AI agent execution and long-running stateful sessions?
+> **Deep Answer**:
+> - **Ray Architecture for AI Platforms**:
+>   1. **Ray Cluster (Head Node + Worker Nodes)**: Global Control Store (GCS) maintains actor locations, task metadata, and cluster scheduling.
+>   2. **Plasma In-Memory Object Store**: Shared-memory object store on each node. Allows multiple worker processes on the same host to access large numpy arrays and model embeddings with zero-copy deserialization.
+>   3. **Object Store Spilling**: When in-memory object storage exceeds memory thresholds, Ray automatically spills unreferenced objects asynchronously to local NVMe SSDs or S3/GCS, preventing worker OOM crashes.
+>   4. **Ray Serve (Stateful Agent Routing)**:
+>      - Supports fractional GPU multiplexing (`@serve.deployment(ray_actor_options={"num_gpus": 0.25})`).
+>      - Direct gRPC / HTTP request routing to stateful Agent Actors with session affinity.
+
+---
+
+### Q39: How does vLLM Chunked Prefill and Prefix Caching eliminate KV-cache recomputation for multi-turn chat and shared system prompts?
+> **Deep Answer**:
+> - **The Prefill vs Decode Problem**:
+>   - **Prefill Phase**: Computes attention over all input prompt tokens in parallel (Compute-Bound). Large prompts (e.g. 10k token documents) block the GPU and stall all decoding streams.
+>   - **Decode Phase**: Generates one token at a time sequentially (Memory-Bound).
+> - **Chunked Prefill Mechanics**:
+>   - Chops large input prompt prefill operations into smaller chunks (e.g. 512 tokens) and co-schedules prefill chunks alongside active decode steps within the same forward iteration.
+>   - Prevents huge TTFT latency spikes for concurrent users.
+> - **Automatic Prefix Caching (APC)**:
+>   - Identifies identical prefix token sequences (e.g. repetitive system prompts, API instructions, RAG context).
+>   - Retains the pre-computed KV-cache blocks in VRAM. Subsequent requests sharing the prefix skip prompt evaluation completely, achieving **$10\times$ faster TTFT** and zero redundant computation.
+
+---
+
+### Q40: How do you design an Agentic Incident Remediation workflow using deterministic human-in-the-loop approval gates and blast-radius safeguards?
+> **Deep Answer**:
+> - **The Danger of Autonomous SRE Agents**: Giving an LLM direct write access to `kubectl delete` or `aws ec2 terminate-instances` risks catastrophic cluster destruction due to prompt injection or hallucinated parameters.
+> - **Defensive Multi-Agent Architecture (LangGraph / Temporal.io)**:
+>   1. **Diagnostic Agent (Read-Only)**: Collects logs, queries Prometheus metrics, reads Kubernetes events, and parses Git diffs using read-only API tokens.
+>   2. **Planning Agent**: Formulates a structured JSON remediation plan:
+>      ```json
+>      {
+>        "action": "restart_deployment",
+>        "target": "payment-api",
+>        "namespace": "production",
+>        "rationale": "High memory leak confirmed by Go heap profile; replica rolling restart will drain leaked nodes",
+>        "rollback_plan": "Revert to image tag sha-abc1234"
+>      }
+>      ```
+>   3. **Deterministic Policy Gatekeeper (OPA/Kyverno)**: Evaluates the plan against hardcoded organizational rules (e.g. *No database drops permitted; max 20% pod restarts at once; production actions require human approval*).
+>   4. **Human-In-The-Loop Interactive Gate**: Posts an interactive Slack/Teams button to the Incident Commander: *"Approve Rolling Restart of payment-api (y/n)?"*
+>   5. **Audited Execution**: Once approved, an execution worker applies the exact command and records full cryptographic audit logs to S3.
